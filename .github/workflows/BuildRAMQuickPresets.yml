@@ -1,0 +1,28 @@
+name: RAM Quick Presets compile (isolated)
+on:
+  push:
+    branches:
+      - 'build/ram-presets-host-20261114'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Get BepInEx references
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://thunderstore.io/package/download/BepInEx/BepInExPack/5.4.2100/' -OutFile bepinex.zip
+          Expand-Archive bepinex.zip -DestinationPath deps -Force
+          Get-ChildItem deps -Recurse -Filter BepInEx.dll | Select-Object -ExpandProperty FullName
+      - name: Build plugin
+        shell: pwsh
+        run: dotnet build ./ram-presets/RAMQuickPresets.csproj -c Release --nologo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RAMQuickPresets-DLL
+          path: ram-presets/bin/Release/net472/RAMQuickPresets.dll
+          if-no-files-found: error
