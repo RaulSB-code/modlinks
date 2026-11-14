@@ -288,7 +288,7 @@ public sealed class Plugin : BaseUnityPlugin {
             try {
                 if(attrs==null)continue;
                 var unity=attrs as UnityEngine.Object;
-                if(unity!=null && unity==null)continue;
+                if(attrs is UnityEngine.Object && unity==null)continue;
                 if(Get(attrs,"shopItem") is bool && (bool)Get(attrs,"shopItem"))continue;
                 object item=Get(attrs,"item");
                 string key=Txt(Get(item,"name"));
