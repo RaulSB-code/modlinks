@@ -12,10 +12,10 @@ using System.Reflection;
 using System.Xml.Serialization;
 
 namespace RAMQuickPresets {
-[BepInPlugin("es.ram.quickpresets.host", "R.A.M. Quick Presets Host", "3.0.0")]
+[BepInPlugin("es.ram.quickpresets.host", "R.A.M. Quick Presets Host", "3.1.0")]
 [BepInDependency("proferabg.REPO.RepoAdminMenu", BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BaseUnityPlugin {
-    const int SLOTS = 5, MONEY_LIMIT = 1000000000, ITEM_LIMIT = 1000;
+    const int SLOTS = 5, MONEY_LIMIT = 1000000000, ITEM_LIMIT = 150;
     const BindingFlags BF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
     static readonly string[] Globals = {"infiniteMoney","noBreak","noBatteryDrain","noTraps","weakEnemies","deafEnemies","blindEnemies","freezeEnemyAI","boomhammer","friendlyDuck","disableShopKeeper","useShopUpgrades"};
     static readonly string[] Flags = {"godModePlayers","noDeathPlayers","infiniteStaminaPlayers","noTargetPlayers","noTumblePlayers","forcedTumble"};
@@ -114,7 +114,7 @@ public sealed class Plugin : BaseUnityPlugin {
             object page=NewPage("R.A.M. - Guardados rapidos","ramquick-presets");
             AddLabel(page,status);
             AddLabel(page,"Nivel / dinero / perks / mejoras / mapas / compras.");
-            AddLabel(page,"Objetos: al cargar solo se generan unidades de compra faltantes.");
+            AddLabel(page,"Objetos: se compara el registro de compras con el equipo que hay en la escena.");
             for(int i=1;i<=SLOTS;i++){
                 int slot=i; bool exists=File.Exists(SlotFile(slot));
                 AddLabel(page,"RANURA "+slot+": "+Summary(slot));
@@ -127,7 +127,7 @@ public sealed class Plugin : BaseUnityPlugin {
                     AddButton(page,"Borrar "+slot,()=>Confirm(page,"Borrar "+slot+"?",()=>Delete(slot)));
                 }
             }
-            AddLabel(page,"Dinero actual: "+Money());
+            AddLabel(page,"Dinero (valor R.A.M. sin multiplicar): "+Money());
             AddButton(page,"+1.000.000",()=>{SetMoney(Math.Min(MONEY_LIMIT,Money()+1000000));Close(page);OpenPresets();});
             AddButton(page,"Establecer 1.000.000",()=>{SetMoney(1000000);Close(page);OpenPresets();});
             AddButton(page,"Volver",()=>Back(page));
@@ -272,42 +272,87 @@ public sealed class Plugin : BaseUnityPlugin {
             }
             try{Call(settingsType,"UpdateClients");}catch(Exception ex){Logger.LogWarning("Settings sync: "+ex.Message);}
             int spawned=RestoreBought(save);
-            status="Cargada ranura "+n+": "+restored+" jugadores, "+spawned+" objetos generados; "+unmatched+" ausentes.";
+            status="Cargada ranura "+n+": "+restored+" jugadores, "+spawned+" apariciones solicitadas; "+unmatched+" ausentes.";
             Logger.LogInfo(status);
         }catch(Exception ex){status="Error cargando "+n+". Ver LogOutput.log";Logger.LogError(ex);}
     }
+    // Scene counts come from ItemManager.spawnedItems, not from the purchase ledger.
+    // This prevents loading the same preset repeatedly from duplicating owned items.
+    Dictionary<string,int> SceneItemCounts(IDictionary registry) {
+        Type manager=FindType("ItemManager");
+        object instance=manager==null ? null : Get(manager,"instance");
+        object raw=instance==null ? null : Get(instance,"spawnedItems");
+        if(raw==null) return null; // Fail closed: never blindly spawn items.
+        var counts=new Dictionary<string,int>(StringComparer.Ordinal);
+        foreach(object attrs in Iter(raw)) {
+            try {
+                if(attrs==null)continue;
+                var unity=attrs as UnityEngine.Object;
+                if(unity!=null && unity==null)continue;
+                if(Get(attrs,"shopItem") is bool && (bool)Get(attrs,"shopItem"))continue;
+                object item=Get(attrs,"item");
+                string key=Txt(Get(item,"name"));
+                if(string.IsNullOrEmpty(key)||!registry.Contains(key))continue;
+                counts[key]=counts.ContainsKey(key)? counts[key]+1 : 1;
+            }catch(Exception e){Logger.LogWarning("Skipping invalid item in scene: "+e.Message);}
+        }
+        return counts;
+    }
+
     int RestoreBought(Slot saved){
         IDictionary bought=Get(Stats,"itemsPurchased") as IDictionary;
         IDictionary registry=Get(Stats,"itemDictionary") as IDictionary;
         if(bought==null||registry==null){Logger.LogWarning("Purchase ledger or item registry not found.");return 0;}
+        var scene=SceneItemCounts(registry);
+        if(scene==null) {Logger.LogWarning("ItemManager.spawnedItems unavailable, avoiding possible duplicates.");return 0;}
+        var totals=new Dictionary<string,int>(StringComparer.Ordinal);
+        foreach(var kv in saved.Items)if(kv!=null&&!string.IsNullOrEmpty(kv.Key)&&kv.Count>0)
+            totals[kv.Key]=Math.Min(ITEM_LIMIT,kv.Count);
+        bool inShop=false;
+        try{inShop=(bool)Call(semi,"RunIsShop");}catch{}
         object settings=ConfigSettings;int prevCount=Num(Get(settings,"spawnerCount"));
-        int total=0;
+        int attempted=0,missingTypes=0;
         try {
             Put(settings,"spawnerCount",1);
-            foreach(var item in saved.Items){
-                if(string.IsNullOrEmpty(item.Key)||item.Count<1)continue;
-                int before=bought.Contains(item.Key)?Num(bought[item.Key]):0;
-                int delta=Math.Max(0,item.Count-before);
-                if(delta==0)continue;
-                object def=registry.Contains(item.Key)?registry[item.Key]:null;
+            foreach(var pair in totals) {
+                string id=pair.Key;int owned=pair.Value;
+                object def=registry.Contains(id)?registry[id]:null;
+                string resolved=id;
                 if(def==null)foreach(DictionaryEntry entry in registry) {
-                    object v=entry.Value;
-                    string name=Txt(Get(v,"name"));
-                    if(string.Equals(Txt(entry.Key),item.Key,StringComparison.OrdinalIgnoreCase)||string.Equals(name,item.Key,StringComparison.OrdinalIgnoreCase)||string.Equals(name,"Item "+item.Key,StringComparison.OrdinalIgnoreCase)){def=v;break;}
+                    object v=entry.Value;string name=Txt(Get(v,"name"));string shortName=Txt(Get(v,"itemName"));
+                    if(string.Equals(Txt(entry.Key),id,StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(name,id,StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(shortName,id,StringComparison.OrdinalIgnoreCase)) {
+                        def=v;resolved=Txt(entry.Key);break;
+                    }
                 }
-                if(def==null){Logger.LogWarning("Unknown purchased item: "+item.Key);continue;}
-                int done=0;
-                for(int i=0;i<delta && total<ITEM_LIMIT;i++){
-                    try{Call(itemType,"spawnItem",def);done++;total++;}
-                    catch(Exception ex){Logger.LogWarning("Spawn purchase "+item.Key+": "+ex.Message);break;}
-                }
-                // Keep the purchase count consistent with what we managed to restore.
-                bought[item.Key]=Math.Max(before,before+done);
-                if(done<delta)Logger.LogWarning("Partial purchase recovery: "+item.Key+" ("+done+"/"+delta+")");
+                if(def==null){missingTypes++;Logger.LogWarning("Purchased item not registered: "+id);continue;}
+                int currentLedger=bought.Contains(resolved)?Num(bought[resolved]):0;
+                // Restore ownership without deleting any newer purchases made in the current run.
+                if(bought.Contains(resolved))bought[resolved]=Math.Max(owned,currentLedger);
+                else bought.Add(resolved,owned);
+                if(inShop)continue; // Shop items cannot be distinguished from goods on sale.
+                int live=scene.ContainsKey(resolved)?scene[resolved]:0;
+                int missing=Math.Max(0,owned-live);
+                if(missing<=0)continue;
+                // Limit physics pile-ups and pathological/corrupt snapshots.
+                int batch=Math.Min(10,Math.Min(missing,ITEM_LIMIT-attempted));
+                if(batch<=0)break;
+                try{
+                    Put(settings,"spawnerCount",batch);
+                    Call(itemType,"spawnItem",def); // R.A.M. uses the host's native REPOLib item spawning.
+                    attempted+=batch;
+                    Logger.LogInfo("Restoring "+resolved+" x"+batch+" ("+live+" already present)");
+                }catch(Exception ex){Logger.LogWarning("Could not spawn "+resolved+": "+ex.Message);}
+                finally {Put(settings,"spawnerCount",1);}
+                if(batch<missing)Logger.LogWarning("Restore limited to "+batch+"/"+missing+" for "+resolved);
             }
-        } finally { if(settings!=null)Put(settings,"spawnerCount",prevCount); }
-        return total;
+        } finally {if(settings!=null)Put(settings,"spawnerCount",prevCount);}
+        if(missingTypes>0)Logger.LogWarning(missingTypes+" item types were not registered, e.g. missing content mods.");
+        if(inShop)Logger.LogInfo("Purchase ownership restored; physical spawning skipped inside shop.");
+        return attempted; // attempted spawns, not confirmed network instances
     }
+
 }
 [Serializable] public class Pair { public string Key; public int Count; }
 [Serializable] public class PlayerState {
